@@ -66,6 +66,19 @@ power_states = {
 }
 
 
+def _mask_to_cidr(mask):
+    maskn = struct.unpack_from('>I', mask)[0]
+    cidr = 32
+    while maskn & 0b1 == 0 and cidr > 0:
+        cidr -= 1
+        maskn >>= 1
+    return cidr
+
+
+def _cidr_to_mask(prefix):
+    return struct.pack('>I', 2**prefix-1 << (32-prefix))
+
+
 class Command(object):
     """Send IPMI commands to BMCs.
 
@@ -552,6 +565,111 @@ class Command(object):
                     rsp['data'])
         self.oem_init()
         return self._oem.get_sensor_reading(sensorname)
+
+    def _fetch_lancfg_param(self, channel, param, prefixlen=False):
+        """Internal helper for fetching lan cfg parameters
+
+        If the parameter revison != 0x11, bail.  Further, if 4 bytes, return
+        string with ipv4.  If 6 bytes, colon delimited hex (mac address).  If
+        one byte, return the int value
+        """
+        fetchcmd = bytearray((channel, param, 0, 0))
+        fetched = self.xraw_command(0xc, 2, data=fetchcmd)
+        fetchdata = fetched['data']
+        if ord(fetchdata[0]) != 17:
+            return None
+        if len(fetchdata) == 5:  # IPv4 address
+            if prefixlen:
+                return _mask_to_cidr(fetchdata[1:])
+            else:
+                ip = socket.inet_ntop(socket.AF_INET, fetchdata[1:])
+                if ip == '0.0.0.0':
+                    return None
+                return ip
+        elif len(fetchdata) == 7:  # MAC address
+            mac = '{0:02x}:{1:02x}:{2:02x}:{3:02x}:{4:02x}:{5:02x}'.format(
+                *bytearray(fetchdata[1:]))
+            if mac == '00:00:00:00:00:00':
+                return None
+            return mac
+        elif len(fetchdata) == 2:
+            return ord(fetchdata[1])
+        else:
+            raise Exception("Unrecognized data format " + repr(fetchdata))
+
+    def set_net_configuration(self, ipv4_address=None, ipv4_configuration=None,
+                              ipv4_gateway=None, channel=None):
+        """Set network configuration data.
+
+        Apply desired network configuration data, leaving unspecified
+        parameters alone.
+
+        :param ipv4_address:  CIDR notation for IP address and netmask
+                          Example: '192.168.0.10/16'
+        :param ipv4_configuration: Method to use to configure the network.
+                        'DHCP' or 'Static'.
+        :param ipv4_gateway: IP address of gateway to use.
+        :param channel:  LAN channel to configure, defaults to autodetect
+        """
+        if channel is None:
+            channel = self.get_network_channel()
+        if ipv4_configuration is not None:
+            cmddata = [channel, 4, 0]
+            if ipv4_configuration.lower() == 'dhcp':
+                cmddata[-1] = 2
+            elif ipv4_configuration.lower() == 'static':
+                cmddata[-1] = 1
+            else:
+                raise Exception('Unrecognized ipv4cfg parameter {0}'.format(
+                    ipv4_configuration))
+            self.xraw_command(netfn=0xc, command=1, data=cmddata)
+        if ipv4_address is not None:
+            netmask = None
+            if '/' in ipv4_address:
+                ipv4_address, prefix = ipv4_address.split('/')
+                netmask = _cidr_to_mask(int(prefix))
+            cmddata = bytearray((channel, 3)) + socket.inet_aton(ipv4_address)
+            self.xraw_command(netfn=0xc, command=1, data=cmddata)
+            if netmask is not None:
+                cmddata = bytearray((channel, 6)) + netmask
+                self.xraw_command(netfn=0xc, command=1, data=cmddata)
+        if ipv4_gateway is not None:
+            cmddata = bytearray((channel, 12)) + socket.inet_aton(ipv4_gateway)
+            self.xraw_command(netfn=0xc, command=1, data=cmddata)
+
+    def get_net_configuration(self, channel=None):
+        """Get network configuration data
+
+        Retrieve network configuration from the target
+
+        :param channel: Channel to configure, defaults to None for 'autodetect'
+        :returns: A dictionary of network configuration data
+        """
+        if channel is None:
+            channel = self.get_network_channel()
+        retdata = {}
+        v4addr = self._fetch_lancfg_param(channel, 3)
+        if v4addr is None:
+            retdata['ipv4_address'] = None
+        else:
+            v4masklen = self._fetch_lancfg_param(channel, 6, prefixlen=True)
+            retdata['ipv4_address'] = '{0}/{1}'.format(v4addr, v4masklen)
+        v4cfgmethods = {
+            0: 'Unspecified',
+            1: 'Static',
+            2: 'DHCP',
+            3: 'BIOS',
+            4:  'Other',
+        }
+        retdata['ipv4_configuration'] = v4cfgmethods[self._fetch_lancfg_param(
+            channel, 4)]
+        retdata['mac_address'] = self._fetch_lancfg_param(channel, 5)
+        retdata['ipv4_gateway'] = self._fetch_lancfg_param(channel, 12)
+        retdata['ipv4_gateway_mac'] = self._fetch_lancfg_param(channel, 13)
+        retdata['ipv4_backup_gateway'] = self._fetch_lancfg_param(channel, 14)
+        retdata['ipv4_backup_gateway_mac'] = self._fetch_lancfg_param(channel,
+                                                                      15)
+        return retdata
 
     def get_sensor_data(self):
         """Get sensor reading objects
@@ -1211,9 +1329,13 @@ class Command(object):
         data = [uid, mode_mask[mode]]
         if password:
             password = str(password)
-            if len(password) > 16:
-                raise Exception('password has limit of 16 chars')
-            password = password.ljust(16, "\x00")
+            if 21 > len(password) > 16:
+                password = password.ljust(20, '\x00')
+                data[0] |= 0b10000000
+            elif len(password) > 20:
+                raise Exception('password has limit of 20 chars')
+            else:
+                password = password.ljust(16, "\x00")
             data.extend([ord(x) for x in password])
         response = self.raw_command(netfn=0x06, command=0x47, data=data)
         if 'error' in response:
@@ -1295,7 +1417,7 @@ class Command(object):
             channel = self.get_network_channel()
         names = {}
         max_ids = self.get_channel_max_user_count(channel)
-        for uid in range(1, max_ids):
+        for uid in range(1, max_ids+1):
             name = self.get_user_name(uid=uid)
             if name is not None:
                 names[uid] = self.get_user(uid=uid, channel=channel)
@@ -1331,16 +1453,29 @@ class Command(object):
     def user_delete(self, uid, channel=None):
         """Delete user (helper)
 
+        Note that in IPMI, user 'deletion' isn't a concept.  This function
+        will make a best effort to provide the expected result (e.g.
+        web interfaces skipping names and ipmitool skipping as well.
+
         :param uid: user number [1:16]
         :param channel: number [1:7]
         """
+        # TODO(jjohnson2): Provide OEM extensibility to cover user deletion
         if channel is None:
             channel = self.get_network_channel()
         self.set_user_password(uid, mode='disable', password=None)
-        self.set_user_name(uid, '')
         # TODO(steveweber) perhaps should set user access on all channels
         # so new users dont get extra access
         self.set_user_access(uid, channel=channel, callback=False,
                              link_auth=False, ipmi_msg=False,
                              privilege_level='no_access')
+        try:
+            # First try to set name to all \x00 explicitly
+            self.set_user_name(uid, '')
+        except Exception:
+            # An invalid data field in request  is frequently reported.
+            # however another convention that exists is all '\xff'
+            # if this fails, pass up the error so that calling code knows
+            # that the deletion did not go as planned for now
+            self.set_user_name(uid, '\xff' * 16)
         return True
