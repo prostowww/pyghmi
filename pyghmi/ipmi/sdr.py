@@ -599,11 +599,6 @@ class SDR(object):
         # since that provides usefully distinct state and this does not
         self.fw_major = rsp['data'][2] & 0b1111111
         self.fw_minor = "%02X" % rsp['data'][3]  # BCD encoding, oddly enough
-        if rsp['data'][1] & 0b10000000:
-            # For lack of any system with 'device sdrs', raise an
-            # exception when they are encountered for now, implement or
-            # ignore later
-            raise NotImplementedError
         self.ipmiversion = rsp['data'][4]  # 51h = 1.5, 02h = 2.0
         self.mfg_id = rsp['data'][8] << 16 + rsp['data'][7] << 8 + \
             rsp['data'][6]
