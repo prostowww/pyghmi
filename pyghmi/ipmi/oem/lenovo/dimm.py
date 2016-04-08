@@ -28,7 +28,8 @@ dimm_fields = (
     EntryField("capacity_mb", "<h",
                valuefunc=lambda v: v*1024),
     EntryField("manufacturer", "30s"),
-    EntryField("serial", "I"),
+    EntryField("serial", ">I",
+               valuefunc=lambda v: hex(v)[2:]),
     EntryField("model", "21s"),
     EntryField("reserved", "h", include=False)
 )
@@ -47,6 +48,7 @@ def get_categories():
                 "netfn": 0x06,
                 "command": 0x59,
                 "data": (0x00, 0xc1, 0x02, 0x00)
-            }
+            },
+            "workaround_bmc_bug": True
         }
     }

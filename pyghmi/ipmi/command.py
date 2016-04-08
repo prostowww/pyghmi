@@ -58,6 +58,7 @@ power_states = {
     "off": 0,
     "on": 1,
     "reset": 3,
+    "diag": 4,
     "softoff": 5,
     "shutdown": 5,
     # NOTE(jbjohnso): -1 is not a valid direct boot state,
@@ -126,8 +127,27 @@ class Command(object):
                                                 port=port,
                                                 kg=kg)
 
+    def register_key_handler(self, callback, type='tls'):
+        """Assign a verification handler for a public key
+
+        When the library attempts to communicate with the management target
+        using a non-IPMI protocol, it will try to verify a key.  This
+        allows a caller to register a key handler for accepting or rejecting
+        a public key/certificate.  The callback will be passed the peer public
+        key or certificate.
+
+        :param callback:  The function to call with public key/certificate
+        :param type: Whether the callback is meant to handle 'tls' or 'ssh',
+                     defaults to 'tls'
+        """
+        if type == 'tls':
+            self._certverify = callback
+        self.oem_init()
+        self._oem.register_key_handler(callback, type)
+
     def logged(self, response):
         self.onlogon(response, self)
+        self.onlogon = None
 
     @classmethod
     def eventloop(cls):
@@ -144,6 +164,19 @@ class Command(object):
         """
         return session.Session.wait_for_rsp(timeout=timeout)
 
+    def _get_device_id(self):
+        response = self.raw_command(netfn=0x06, command=0x01)
+        if 'error' in response:
+            raise exc.IpmiException(response['error'], code=response['code'])
+        return {
+            'device_id': response['data'][0],
+            'device_revision': response['data'][1] & 0b1111,
+            'manufacturer_id': struct.unpack(
+                '<I', struct.pack('3B', *response['data'][6:9]) + '\x00')[0],
+            'product_id': struct.unpack(
+                '<H', struct.pack('2B', *response['data'][9:11]))[0],
+        }
+
     def oem_init(self):
         """Initialize the command object for OEM capabilities
 
@@ -154,17 +187,7 @@ class Command(object):
         """
         if self._oem:
             return
-        response = self.raw_command(netfn=6, command=1)
-        if 'error' in response:
-            raise exc.IpmiException(response['error'], code=response['code'])
-        self._oem = get_oem_handler({
-            'device_id': response['data'][0],
-            'device_revision': response['data'][1] & 0b1111,
-            'manufacturer_id': struct.unpack(
-                '<I', struct.pack('3B', *response['data'][6:9]) + '\x00')[0],
-            'product_id': struct.unpack(
-                '<H', struct.pack('2B', *response['data'][9:11]))[0],
-        }, self)
+        self._oem = get_oem_handler(self._get_device_id(), self)
 
     def get_bootdev(self):
         """Get current boot device override information.
@@ -266,6 +289,23 @@ class Command(object):
         else:
             return lastresponse
 
+    def get_video_launchdata(self):
+        """Get data required to launch a remote video session to target.
+
+        This is a highly proprietary scenario, the return data may vary greatly
+        host to host.  The return should be a dict describing the type of data
+        and the data.  For example {'jnlp': jnlpstring}
+        """
+        self.oem_init()
+        return self._oem.get_video_launchdata()
+
+    def reset_bmc(self):
+        """Do a cold reset in BMC
+        """
+        response = self.raw_command(netfn=6, command=2)
+        if 'error' in response:
+            raise exc.IpmiException(response['error'])
+
     def set_bootdev(self,
                     bootdev,
                     persist=False,
@@ -314,7 +354,7 @@ class Command(object):
         return {'bootdev': bootdev}
 
     def xraw_command(self, netfn, command, bridge_request=(), data=(),
-                     delay_xmit=None):
+                     delay_xmit=None, retry=True, timeout=None):
         """Send raw ipmi command to BMC, raising exception on error
 
         This is identical to raw_command, except it raises exceptions
@@ -328,18 +368,23 @@ class Command(object):
         :param bridge_request: The target slave address and channel number for
                                the bridge request.
         :param data: Command data as a tuple or list
+        :param retry: Whether to retry this particular payload or not, defaults
+                      to true.
+        :param timeout: A custom time to wait for initial reply, useful for
+                        a slow command.  This may interfere with retry logic.
         :returns: dict -- The response from IPMI device
         """
         rsp = self.ipmi_session.raw_command(netfn=netfn, command=command,
                                             bridge_request=bridge_request,
-                                            data=data, delay_xmit=delay_xmit)
+                                            data=data, delay_xmit=delay_xmit,
+                                            retry=retry, timeout=timeout)
         if 'error' in rsp:
             raise exc.IpmiException(rsp['error'], rsp['code'])
         rsp['data'] = buffer(bytearray(rsp['data']))
         return rsp
 
     def raw_command(self, netfn, command, bridge_request=(), data=(),
-                    delay_xmit=None):
+                    delay_xmit=None, retry=True, timeout=None):
         """Send raw ipmi command to BMC
 
         This allows arbitrary IPMI bytes to be issued.  This is commonly used
@@ -352,11 +397,15 @@ class Command(object):
         :param bridge_request: The target slave address and channel number for
                                the bridge request.
         :param data: Command data as a tuple or list
+        :param retry: Whether or not to retry command if no response received.
+                      Defaults to True
+        :param timeout: A custom amount of time to wait for initial reply
         :returns: dict -- The response from IPMI device
         """
         return self.ipmi_session.raw_command(netfn=netfn, command=command,
                                              bridge_request=bridge_request,
-                                             data=data, delay_xmit=delay_xmit)
+                                             data=data, delay_xmit=delay_xmit,
+                                             retry=retry, timeout=timeout)
 
     def get_power(self):
         """Get current power state of the managed system
@@ -504,8 +553,15 @@ class Command(object):
         if 'error' not in guiddata:
             zerofru['UUID'] = pygutil.decode_wireformat_uuid(
                 guiddata['data'])
-        if not zerofru:
-            zerofru = None
+        # Add some fields returned by get device ID command to FRU 0
+        # Also rename them to something more in line with FRU 0 field naming
+        # standards
+        device_id = self._get_device_id()
+        device_id['Device ID'] = device_id.pop('device_id')
+        device_id['Device Revision'] = device_id.pop('device_revision')
+        device_id['Manufacturer ID'] = device_id.pop('manufacturer_id')
+        device_id['Product ID'] = device_id.pop('product_id')
+        zerofru.update(device_id)
         return self._oem.process_fru(zerofru)
 
     def get_inventory(self):
@@ -530,6 +586,30 @@ class Command(object):
             yield (self._sdr.fru[fruid].fru_name, fruinf)
         for componentpair in self._oem.get_oem_inventory():
             yield componentpair
+
+    def get_leds(self):
+        """Get LED status information
+
+        This provides a detailed view of the LEDs of the managed system.
+        """
+        self.oem_init()
+        return self._oem.get_leds()
+
+    def get_ntp_enabled(self):
+        self.oem_init()
+        return self._oem.get_ntp_enabled()
+
+    def set_ntp_enabled(self, enable):
+        self.oem_init()
+        return self._oem.set_ntp_enabled(enable)
+
+    def get_ntp_servers(self):
+        self.oem_init()
+        return self._oem.get_ntp_servers()
+
+    def set_ntp_server(self, server, index=0):
+        self.oem_init()
+        return self._oem.set_ntp_server(server, index)
 
     def get_health(self):
         """Summarize health of managed system
@@ -637,12 +717,13 @@ class Command(object):
             cmddata = bytearray((channel, 12)) + socket.inet_aton(ipv4_gateway)
             self.xraw_command(netfn=0xc, command=1, data=cmddata)
 
-    def get_net_configuration(self, channel=None):
+    def get_net_configuration(self, channel=None, gateway_macs=True):
         """Get network configuration data
 
         Retrieve network configuration from the target
 
         :param channel: Channel to configure, defaults to None for 'autodetect'
+        :param gateway_macs: Whether to retrieve mac addresses for gateways
         :returns: A dictionary of network configuration data
         """
         if channel is None:
@@ -665,10 +746,13 @@ class Command(object):
             channel, 4)]
         retdata['mac_address'] = self._fetch_lancfg_param(channel, 5)
         retdata['ipv4_gateway'] = self._fetch_lancfg_param(channel, 12)
-        retdata['ipv4_gateway_mac'] = self._fetch_lancfg_param(channel, 13)
         retdata['ipv4_backup_gateway'] = self._fetch_lancfg_param(channel, 14)
-        retdata['ipv4_backup_gateway_mac'] = self._fetch_lancfg_param(channel,
-                                                                      15)
+        if gateway_macs:
+            retdata['ipv4_gateway_mac'] = self._fetch_lancfg_param(channel, 13)
+            retdata['ipv4_backup_gateway_mac'] = self._fetch_lancfg_param(
+                channel, 15)
+        self.oem_init()
+        self._oem.add_extra_net_configuration(retdata)
         return retdata
 
     def get_sensor_data(self):
@@ -766,7 +850,7 @@ class Command(object):
         configuration.  The following keys may be present:
         acknowledge_required - Indicates whether the target expects an
                                acknowledgement
-        acknowledgement_timeout - How long it will wait for an acknowledgment
+        acknowledge_timeout - How long it will wait for an acknowledgment
                                   before retrying
         retries - How many attempts will be made to deliver the alert to this
                   destination
@@ -785,7 +869,7 @@ class Command(object):
         destinfo['acknowledge_required'] = dtype & 0b10000000 == 0b10000000
         # Ignore destination type for now...
         if destinfo['acknowledge_required']:
-            destinfo['acknowledgement_timeout'] = acktimeout
+            destinfo['acknowledge_timeout'] = acktimeout
         destinfo['retries'] = retries
         rqdata = (channel, 19, destination, 0)
         rsp = self.xraw_command(netfn=0xc, command=2, data=rqdata)
@@ -827,6 +911,41 @@ class Command(object):
         cmddata = bytearray((channel, 16))
         cmddata += community
         self.xraw_command(netfn=0xc, command=1, data=cmddata)
+
+    def _assure_alert_policy(self, channel, destination):
+        """Make sure an alert policy exists
+
+        Each policy will be a dict with the following keys:
+        -'index' - The policy index number
+        :returns: An iterable of currently configured alert policies
+        """
+        # First we do a get PEF configuration parameters to get the count
+        # of entries.  We have no guarantee that the meaningful data will
+        # be contiguous
+        rsp = self.xraw_command(netfn=4, command=0x13, data=(8, 0, 0))
+        numpol = ord(rsp['data'][1])
+        desiredchandest = (channel << 4) | destination
+        availpolnum = None
+        for polnum in xrange(1, numpol + 1):
+            currpol = self.xraw_command(netfn=4, command=0x13,
+                                        data=(9, polnum, 0))
+            polidx, chandest = struct.unpack_from('>BB', currpol['data'][2:4])
+            if not polidx & 0b1000:
+                if availpolnum is None:
+                    availpolnum = polnum
+                continue
+            if chandest == desiredchandest:
+                return True
+        # If chandest did not equal desiredchandest ever, we need to use a slot
+        if availpolnum is None:
+            raise Exception("No available alert policy entry")
+        # 24 = 1 << 4 | 8
+        # 1 == set to which this rule belongs
+        # 8 == 0b1000, in other words, enable this policy, always send to
+        # indicated destination
+        self.xraw_command(netfn=4, command=0x12,
+                          data=(9, availpolnum, 24,
+                                desiredchandest, 0))
 
     def get_alert_community(self, channel=None):
         """Get the current community string for alerts
@@ -895,6 +1014,59 @@ class Command(object):
             destreq = bytearray((channel, 18))
             destreq.extend(currtype)
             self.xraw_command(netfn=0xc, command=1, data=destreq)
+        if not ip == '0.0.0.0':
+            self._assure_alert_policy(channel, destination)
+
+    def get_mci(self):
+        """Get the Management Controller Identifier, per DCMI specification
+
+        :returns: The identifier as a string
+        """
+        return self._chunkwise_dcmi_fetch(9)
+
+    def set_mci(self, mci):
+        """Set the management controller identifier, per DCMI specification
+
+        """
+        return self._chunkwise_dcmi_set(0xa, mci + '\x00')
+
+    def get_asset_tag(self):
+        """Get the system asset tag, per DCMI specification
+
+        :returns: The asset tag
+        """
+        return self._chunkwise_dcmi_fetch(6)
+
+    def set_asset_tag(self, tag):
+        """Set the asset tag value
+
+        """
+        return self._chunkwise_dcmi_set(8, tag)
+
+    def _chunkwise_dcmi_fetch(self, command):
+        szdata = self.xraw_command(
+            netfn=0x2c, command=command, data=(0xdc, 0, 0))
+        totalsize = ord(szdata['data'][1])
+        chksize = 0xf
+        offset = 0
+        retstr = ''
+        while offset < totalsize:
+            if (offset + chksize) > totalsize:
+                chksize = totalsize - offset
+            chk = self.xraw_command(
+                netfn=0x2c, command=command, data=(0xdc, offset, chksize))
+            retstr += chk['data'][2:]
+            offset += chksize
+        return retstr
+
+    def _chunkwise_dcmi_set(self, command, data):
+        chunks = [data[i:i+15] for i in xrange(0, len(data), 15)]
+        offset = 0
+        for chunk in chunks:
+            chunk = bytearray(chunk, 'utf-8')
+            cmddata = bytearray((0xdc, offset, len(chunk)))
+            cmddata += chunk
+            self.xraw_command(netfn=0x2c, command=command, data=cmddata)
 
     def set_channel_access(self, channel=None,
                            access_update_mode='non_volatile',
@@ -1479,3 +1651,83 @@ class Command(object):
             # that the deletion did not go as planned for now
             self.set_user_name(uid, '\xff' * 16)
         return True
+
+    def disable_user(self, uid, mode):
+        """Disable User
+
+        Just disable the User.
+        This will not disable the password or revoke privileges.
+
+        :param uid: user number [1:16]
+        :param mode:
+            disable       = disable user connections
+            enable        = enable user connections
+        """
+        self.set_user_password(uid, mode)
+        return True
+
+    def get_firmware(self):
+        """Retrieve OEM Firmware information
+        """
+        self.oem_init()
+        return self._oem.get_oem_firmware()
+
+    def get_capping_enabled(self):
+        """Get PSU based power capping status
+
+        :return: True if enabled and False if disabled
+        """
+        self.oem_init()
+        return self._oem.get_oem_capping_enabled()
+
+    def set_capping_enabled(self, enable):
+        """Set PSU based power capping
+
+        :param enable: True for enable and False for disable
+        """
+        self.oem_init()
+        return self._oem.set_oem_capping_enabled(enable)
+
+    def get_remote_kvm_available(self):
+        """Get remote KVM availability
+        """
+        self.oem_init()
+        return self._oem.get_oem_remote_kvm_available()
+
+    def get_domain_name(self):
+        """Get Domain name
+        """
+        self.oem_init()
+        return self._oem.get_oem_domain_name()
+
+    def set_domain_name(self, name):
+        """Set Domain name
+
+        :param name: domain name to be set
+        """
+        self.oem_init()
+        self._oem.set_oem_domain_name(name)
+
+    def get_graphical_console(self):
+        """Get graphical console launcher"""
+        self.oem_init()
+        return self._oem.get_graphical_console()
+
+    def attach_remote_media(self, url, username=None, password=None):
+        """Attach remote media by url
+
+        Given a url, attach remote media (cd/usb image) to the target system.
+
+        :param url:  URL to indicate where to find image (protocol support
+                     varies by BMC)
+        :param username: Username for endpoint to use when accessing the URL.
+                         If applicable, 'domain' would be indicated by '@' or
+                         '\' syntax.
+        :param password: Password for endpoint to use when accessing the URL.
+        """
+        self.oem_init()
+        self._oem.attach_remote_media(url, username, password)
+
+    def detach_remote_media(self):
+        self.oem_init()
+        self._oem.detach_remote_media()

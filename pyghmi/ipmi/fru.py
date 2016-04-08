@@ -37,7 +37,7 @@ import pyghmi.ipmi.private.spd as spd
 import struct
 import time
 
-fruepoch = time.mktime(time.strptime('1/1/1996', "%m/%d/%Y"))
+fruepoch = 820454400  # 1/1/1996, 0:00
 
 # This is from SMBIOS specification Table 16
 enclosure_types = {
@@ -186,16 +186,21 @@ class FRU(object):
             frutype = self.sdr.fru_type_and_modifier >> 8
             frusubtype = self.sdr.fru_type_and_modifier & 0xff
             if frutype > 0x10 or frutype < 0x8 or frusubtype not in (0, 1, 2):
-                raise iexc.PyghmiException(
-                    'Unsupported FRU device: {0:x}h, {1:x}h'.format(frutype,
-                                                                    frusubtype
-                                                                    ))
+                return
+                #TODO(jjohnson2): strict mode to detect pyghmi and BMC
+                #gaps
+                # raise iexc.PyghmiException(
+                #     'Unsupported FRU device: {0:x}h, {1:x}h'.format(frutype,
+                #                                                    frusubtype
+                #                                                    ))
             elif frusubtype == 1:
                 self.myspd = spd.SPD(self.databytes)
                 self.info = self.myspd.info
                 return
         if self.databytes[0] != 1:
-            raise iexc.BmcErrorException("Invalid/Unsupported FRU format")
+            return
+            #TODO(jjohnson2): strict mode to flag potential BMC errors
+            # raise iexc.BmcErrorException("Invalid/Unsupported FRU format")
         # Ignore the internal use even if present.
         self._parse_chassis()
         self._parse_board()
@@ -214,9 +219,16 @@ class FRU(object):
             # return it as a bytearray, not much to be done for it
             return retinfo, newoffset
         elif currtype == 3:  # text string
-            if lang == 0:
+            # Sometimes BMCs have FRU data with 0xff termination
+            # contrary to spec, but can be tolerated
+            # also in case something null terminates, handle that too
+            # strictly speaking, \xff should be a y with diaeresis, but
+            # erring on the side of that not being very relevant in practice
+            # to fru info, particularly the last values
+            retinfo = retinfo.rstrip('\xff\x00 ')
+            if lang in (0, 25):
                 try:
-                    retinfo = retinfo.decode('utf-8')
+                    retinfo = retinfo.decode('iso-8859-1')
                 except UnicodeDecodeError:
                     pass
             else:

@@ -29,10 +29,22 @@ class IpmiException(PyghmiException):
         self.ipmicode = code
 
 
+class UnrecognizedCertificate(Exception):
+    def __init__(self, text='', certdata=None):
+        super(UnrecognizedCertificate, self).__init__(text)
+        self.certdata = certdata
+
+
 class InvalidParameterValue(PyghmiException):
     pass
 
 
 class BmcErrorException(IpmiException):
     # This denotes when library detects an invalid BMC behavior
+    pass
+
+
+class UnsupportedFunctionality(PyghmiException):
+    # Indicates when functionality is requested that is not supported by
+    # current endpoint
     pass

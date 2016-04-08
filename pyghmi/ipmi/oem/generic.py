@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pyghmi.exceptions as exc
+
 
 class OEMHandler(object):
     """Handler class for OEM capabilities.
@@ -26,6 +28,25 @@ class OEMHandler(object):
     """
     def __init__(self, oemid, ipmicmd):
         pass
+
+    def register_key_handler(self, callback, type='tls'):
+        """Assign a verification handler for a public key
+
+        When the library attempts to communicate with the management target
+        using a non-IPMI protocol, it will try to verify a key.  This
+        allows a caller to register a key handler for accepting or rejecting
+        a public key/certificate.  The callback will be passed the peer public
+        key or certificate.
+
+        :param callback:  The function to call with public key/certificate
+        :param type: Whether the callback is meant to handle 'tls' or 'ssh',
+                     defaults to 'tls'
+        """
+        if type == 'tls':
+            self._certverify = callback
+
+    def get_video_launchdata(self):
+        return {}
 
     def process_event(self, event, ipmicmd, seldata):
         """Modify an event according with OEM understanding.
@@ -97,6 +118,45 @@ class OEMHandler(object):
         """
         return None
 
+    def get_leds(self):
+        """Get tuples of LED categories.
+
+        Each category contains a category name and a dicionary of LED names
+        with their status as values.
+        """
+        return ()
+
+    def get_ntp_enabled(self):
+        """Get whether ntp is enabled or not
+
+        :returns: True if enabled, False if disabled, None if unsupported
+        """
+        return None
+
+    def set_ntp_enabled(self, enabled):
+        """Set whether NTP should be enabled
+
+        :returns: True on success
+        """
+        return None
+
+    def get_ntp_servers(self):
+        """Get current set of configured NTP servers
+
+        :returns iterable of configured NTP servers:
+        """
+        return ()
+
+    def set_ntp_server(self, server, index=0):
+        """Set an ntp server
+
+        :param server:  Destination address of server to reach
+        :param index: Index of server to configure, primary assumed if not
+        specified
+        :returns: True if success
+        """
+        return None
+
     def process_fru(self, fru):
         """Modify a fru entry with OEM understanding.
 
@@ -114,3 +174,58 @@ class OEMHandler(object):
             return fru
         fru['oem_parser'] = None
         return fru
+
+    def get_oem_firmware(self):
+        """Get Firmware information.
+        """
+        return ()
+
+    def get_oem_capping_enabled(self):
+        """Get PSU based power capping status
+
+        :return: True if enabled and False if disabled
+        """
+        return ()
+
+    def set_oem_capping_enabled(self, enable):
+        """Set PSU based power capping
+
+        :param enable: True for enable and False for disable
+        """
+        return ()
+
+    def get_oem_remote_kvm_available(self):
+        """Get remote KVM availability
+        """
+        return False
+
+    def get_oem_domain_name(self):
+        """Get Domain name
+        """
+        return ()
+
+    def set_oem_domain_name(self, name):
+        """Set Domain name
+
+        :param name: domain name to be set
+        """
+        return ()
+
+    def get_graphical_console(self):
+        """Get graphical console launcher"""
+        return ()
+
+    def add_extra_net_configuration(self, netdata):
+        """Add additional network configuration data
+
+        Given a standard netdata struct, add details as relevant from
+        OEM commands, modifying the passed dictionary
+        :param netdata: Dictionary to store additional network data
+        """
+        return
+
+    def detach_remote_media(self):
+        raise exc.UnsupportedFunctionality()
+
+    def attach_remote_media(self, imagename, username, password):
+        raise exc.UnsupportedFunctionality()
